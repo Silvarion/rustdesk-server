@@ -89,9 +89,8 @@ struct Inner {
 
 #[derive(Clone)]
 pub struct RendezvousServer {
-    // (Sink, EncryptState): the EncryptState travels WITH the stashed sink so a later,
-    // out-of-band send via this same connection (e.g. a RelayResponse) still gets encrypted
-    // if this connection completed a secure_tcp key exchange.
+    // (Sink, EncryptState) -- see EncryptState's own doc comment above for why the two travel
+    // together.
     tcp_punch: Arc<Mutex<HashMap<SocketAddr, (Sink, EncryptState)>>>,
     pm: PeerMap,
     tx: Sender,
@@ -1307,17 +1306,11 @@ impl RendezvousServer {
         } else {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
             sink = Some(Sink::TcpStream(a));
-            // Proactively send the server's signed ephemeral public key as the very first
-            // message on this connection, before waiting to receive anything -- this is the
-            // half of the secure_tcp handshake vanilla hbbs never implemented (see handle_tcp's
-            // KeyExchange arm for the other half, and issue #394 for the original PoC this is
-            // based on). Sent unencrypted (encrypt is still None here), matching what the
-            // client's own key_exchange() expects as its first message. Skipped entirely when
-            // self.inner.sk is None, i.e. hbbs was started with an arbitrary non-crypto -k
-            // string (legacy shared-key mode) rather than a real keypair/generated key -- that
-            // mode has no secret key to sign with, so this improvement doesn't apply to it and
-            // behavior there is unchanged (a TCP-mode client against such a server still times
-            // out exactly as before).
+            // Proactively send our half of the exchange (see handle_tcp's KeyExchange arm)
+            // before waiting to receive anything, unencrypted, matching what the client's own
+            // key_exchange() expects as its first message. Skipped when self.inner.sk is None,
+            // i.e. hbbs was started with an arbitrary non-crypto -k string (legacy shared-key
+            // mode, nothing to sign with) -- that mode's behavior is unchanged.
             if let Some(sk) = self.inner.sk.as_ref() {
                 let (our_pk, our_sk) = box_::gen_keypair();
                 let signed = sign::sign(&our_pk.0, sk);
