@@ -1672,23 +1672,23 @@ mod tests {
     // crypto primitives above would still pass.
     #[hbb_common::tokio::test]
     async fn secure_tcp_production_handshake_and_stashed_sink_response() {
-        // PeerMap::new() has no way to select its DB backend other than this env var (its
-        // `map` field is private to peer.rs, so PeerMap can't be constructed directly from
-        // here) -- and Database::new() unconditionally pre-creates a literal file matching
-        // whatever string it's given (see database.rs), so "sqlite::memory:" doesn't actually
-        // avoid an on-disk artifact here the way it would with a bare sqlx connection. Route it
-        // through the OS temp dir instead and clean up explicitly at the end, rather than
-        // leaving a stray file in the crate's own working directory.
+        // PeerMap::new_with_db_url (test-only, see peer.rs) instead of PeerMap::new() +
+        // std::env::set_var("DB_URL", ...): DB_URL is process-global, and cargo test runs
+        // tests in parallel by default within one binary, so mutating it here with no
+        // restore/serialization would risk another test observing this test's DB path (or
+        // vice versa). Database::new() also unconditionally pre-creates a literal file
+        // matching whatever path it's given (see database.rs), so route it through the OS
+        // temp dir and clean up explicitly at the end, rather than leaving a stray file in
+        // the crate's own working directory.
         let db_path = std::env::temp_dir().join(format!(
             "hbbs_secure_tcp_test_{}.sqlite3",
             std::process::id()
         ));
-        std::env::set_var("DB_URL", db_path.to_str().unwrap());
 
         let (server_pk, server_sk) = sign::gen_keypair();
-        let pm = PeerMap::new()
+        let pm = PeerMap::new_with_db_url(db_path.to_str().unwrap())
             .await
-            .expect("PeerMap::new with an in-memory DB must succeed");
+            .expect("PeerMap::new_with_db_url must succeed");
         let (tx, _rx) = mpsc::unbounded_channel::<Data>();
         let mut server = RendezvousServer {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
