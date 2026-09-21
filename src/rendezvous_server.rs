@@ -1603,4 +1603,220 @@ mod tests {
             .expect("client must decrypt what the server encrypted");
         assert_eq!(&buf[..], &plaintext[..]);
     }
+
+    // The wire framing `Framed<TcpStream, BytesCodec>` (hbb_common's own bytes_codec, NOT
+    // tokio_util's raw pass-through codec of the same name) actually uses: a 1-4 byte
+    // variable-length header (`(len << 2) | size_class`, little-endian, size_class picked by
+    // how many bytes `len` needs) followed by that many payload bytes. Test helpers below
+    // replicate encode()/decode() exactly so a plain TcpStream (no Framed wrapper) can speak
+    // the same protocol handle_listener_inner's real client connections use.
+    fn encode_frame(payload: &[u8]) -> Vec<u8> {
+        let len = payload.len();
+        let mut out = Vec::with_capacity(len + 4);
+        if len <= 0x3F {
+            out.push((len << 2) as u8);
+        } else if len <= 0x3FFF {
+            out.extend_from_slice(&(((len << 2) as u16) | 0x1).to_le_bytes());
+        } else if len <= 0x3FFFFF {
+            let h = ((len << 2) as u32) | 0x2;
+            out.extend_from_slice(&h.to_le_bytes()[..3]);
+        } else {
+            out.extend_from_slice(&(((len << 2) as u32) | 0x3).to_le_bytes());
+        }
+        out.extend_from_slice(payload);
+        out
+    }
+
+    async fn read_frame(stream: &mut TcpStream) -> Vec<u8> {
+        let mut first = [0u8; 1];
+        stream
+            .read_exact(&mut first)
+            .await
+            .expect("must read the frame header's first byte");
+        let head_len = ((first[0] & 0x3) + 1) as usize;
+        let mut head = vec![0u8; head_len];
+        head[0] = first[0];
+        if head_len > 1 {
+            stream
+                .read_exact(&mut head[1..])
+                .await
+                .expect("must read the remaining frame header bytes");
+        }
+        let mut n = head[0] as usize;
+        if head_len > 1 {
+            n |= (head[1] as usize) << 8;
+        }
+        if head_len > 2 {
+            n |= (head[2] as usize) << 16;
+        }
+        if head_len > 3 {
+            n |= (head[3] as usize) << 24;
+        }
+        n >>= 2;
+        let mut payload = vec![0u8; n];
+        stream
+            .read_exact(&mut payload)
+            .await
+            .expect("must read the full frame payload");
+        payload
+    }
+
+    // Addresses the gap the round-trip test above deliberately doesn't cover: this drives the
+    // REAL production code path over an actual TCP socket -- handle_listener_inner's proactive
+    // send, handle_tcp's KeyExchange arm, the main loop's plaintext-to-encrypted transition
+    // (the `enc.dec(&mut bytes)` step in handle_listener_inner), and handle_tcp's
+    // PunchHoleRequest arm, which stashes (sink, encrypt) into tcp_punch and then immediately
+    // calls send_to_tcp_sync to retrieve that exact stashed pair and send an encrypted
+    // response back through it. A regression in any of that wiring (frame ordering, the wrong
+    // Encrypt instance ending up in the sink, etc.) would fail here even though the isolated
+    // crypto primitives above would still pass.
+    #[hbb_common::tokio::test]
+    async fn secure_tcp_production_handshake_and_stashed_sink_response() {
+        // PeerMap::new() has no way to select its DB backend other than this env var (its
+        // `map` field is private to peer.rs, so PeerMap can't be constructed directly from
+        // here) -- and Database::new() unconditionally pre-creates a literal file matching
+        // whatever string it's given (see database.rs), so "sqlite::memory:" doesn't actually
+        // avoid an on-disk artifact here the way it would with a bare sqlx connection. Route it
+        // through the OS temp dir instead and clean up explicitly at the end, rather than
+        // leaving a stray file in the crate's own working directory.
+        let db_path = std::env::temp_dir().join(format!(
+            "hbbs_secure_tcp_test_{}.sqlite3",
+            std::process::id()
+        ));
+        std::env::set_var("DB_URL", db_path.to_str().unwrap());
+
+        let (server_pk, server_sk) = sign::gen_keypair();
+        let pm = PeerMap::new()
+            .await
+            .expect("PeerMap::new with an in-memory DB must succeed");
+        let (tx, _rx) = mpsc::unbounded_channel::<Data>();
+        let mut server = RendezvousServer {
+            tcp_punch: Arc::new(Mutex::new(HashMap::new())),
+            pm,
+            tx,
+            relay_servers: Default::default(),
+            relay_servers0: Default::default(),
+            rendezvous_servers: Arc::new(Vec::new()),
+            inner: Arc::new(Inner {
+                serial: 0,
+                version: String::new(),
+                software_url: String::new(),
+                mask: None,
+                local_ip: String::new(),
+                sk: Some(server_sk),
+            }),
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("must bind a local test listener");
+        let server_addr = listener.local_addr().unwrap();
+
+        // handle_listener_inner takes &mut self and only returns when the connection closes,
+        // so it runs on a clone (tcp_punch is Arc-wrapped, so writes from this task are still
+        // visible through the original `server` handle kept in this test).
+        let mut server_conn = server.clone();
+        tokio::spawn(async move {
+            let (stream, addr) = listener
+                .accept()
+                .await
+                .expect("must accept the test client");
+            allow_err!(
+                server_conn
+                    .handle_listener_inner(stream, addr, "", false)
+                    .await
+            );
+        });
+
+        let mut client = TcpStream::connect(server_addr)
+            .await
+            .expect("must connect to the test listener");
+
+        // --- Read the server's proactive, unencrypted KeyExchange (handle_listener_inner) ---
+        let frame = read_frame(&mut client).await;
+        let msg_in = RendezvousMessage::parse_from_bytes(&frame)
+            .expect("server's first message must be a valid RendezvousMessage");
+        let Some(rendezvous_message::Union::KeyExchange(ex)) = msg_in.union else {
+            panic!(
+                "server's first message must be a KeyExchange, got {:?}",
+                msg_in.union
+            );
+        };
+        assert_eq!(
+            ex.keys.len(),
+            1,
+            "server's KeyExchange must carry exactly its signed ephemeral pubkey"
+        );
+        let server_eph_pk_bytes = sign::verify(&ex.keys[0], &server_pk)
+            .expect("client must be able to verify the server's signature with its trusted long-term pubkey");
+        let server_eph_pk = box_::PublicKey(
+            server_eph_pk_bytes
+                .try_into()
+                .expect("verified payload must be exactly one box_ public key"),
+        );
+
+        // --- Client's reply, exactly as key_exchange()/create_symmetric_key_msg() build it ---
+        let (client_eph_pk, client_eph_sk) = box_::gen_keypair();
+        let plain_key = secretbox::gen_key();
+        let nonce = box_::Nonce([0u8; box_::NONCEBYTES]);
+        let sealed_key = box_::seal(&plain_key.0, &nonce, &server_eph_pk, &client_eph_sk);
+        let mut reply = RendezvousMessage::new();
+        reply.set_key_exchange(KeyExchange {
+            keys: vec![
+                Bytes::from(Vec::from(client_eph_pk.0)),
+                Bytes::from(sealed_key),
+            ],
+            ..Default::default()
+        });
+        client
+            .write_all(&encode_frame(&reply.write_to_bytes().unwrap()))
+            .await
+            .expect("must send the client's KeyExchange reply");
+
+        // --- Encrypted PunchHoleRequest for a nonexistent id: exercises the plaintext-to-
+        // encrypted transition, handle_tcp's PunchHoleRequest arm, and the stashed-sink
+        // response path (handle_tcp_punch_hole_request -> send_to_tcp_sync) end to end ---
+        let mut client_crypto = Encrypt::new(plain_key);
+        let mut req = RendezvousMessage::new();
+        req.set_punch_hole_request(PunchHoleRequest {
+            id: "secure-tcp-test-nonexistent-id".to_owned(),
+            ..Default::default()
+        });
+        let ciphertext = client_crypto.enc(&req.write_to_bytes().unwrap());
+        client
+            .write_all(&encode_frame(&ciphertext))
+            .await
+            .expect("must send the encrypted PunchHoleRequest");
+
+        let frame = read_frame(&mut client).await;
+        let mut resp_bytes = BytesMut::from(&frame[..]);
+        client_crypto
+            .dec(&mut resp_bytes)
+            .expect("client must decrypt the response sent back through the stashed sink");
+        let msg_resp = RendezvousMessage::parse_from_bytes(&resp_bytes)
+            .expect("decrypted response must be a valid RendezvousMessage");
+        match msg_resp.union {
+            Some(rendezvous_message::Union::PunchHoleResponse(r)) => {
+                assert_eq!(
+                    r.failure,
+                    punch_hole_response::Failure::ID_NOT_EXIST.into(),
+                    "nonexistent id must produce ID_NOT_EXIST, not some other response"
+                );
+            }
+            other => panic!("expected an encrypted PunchHoleResponse, got {:?}", other),
+        }
+
+        // The sink was taken out of the connection loop and stashed in tcp_punch by
+        // send_to_tcp_sync's own `.remove(...)` -- confirms this test actually exercised the
+        // stash-then-retrieve path, not some other reply mechanism that happened to look the
+        // same from the client's side.
+        assert!(
+            server.tcp_punch.lock().await.is_empty(),
+            "the stashed (sink, encrypt) pair must have been removed by send_to_tcp_sync"
+        );
+
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{}-shm", db_path.display()));
+        let _ = std::fs::remove_file(format!("{}-wal", db_path.display()));
+    }
 }
